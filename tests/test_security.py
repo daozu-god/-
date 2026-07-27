@@ -8,6 +8,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -30,7 +32,9 @@ def write_password_store(path, admin_password, alice_password):
             "alice": generate_password_hash(alice_password, method="scrypt"),
         },
     }
-    Path(path).write_text(json.dumps(payload), encoding="utf-8")
+    store_path = Path(path)
+    store_path.write_text(json.dumps(payload), encoding="utf-8")
+    os.chmod(store_path, 0o600)
 
 
 def valid_config(user_store_path):
@@ -202,6 +206,7 @@ class SecurityConfigurationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             store_path = Path(temp_dir) / "users.json"
             store_path.write_text('[{"unexpected": true}]', encoding="utf-8")
+            os.chmod(store_path, 0o600)
             config = valid_config(store_path)
 
             try:
@@ -237,7 +242,8 @@ class SecurityConfigurationTests(unittest.TestCase):
         self.assertTrue(config_path.is_file(), "Nginx HTTPS config is missing")
         config = config_path.read_text(encoding="utf-8")
         self.assertIn("listen 80", config)
-        self.assertIn("return 308 https://$host$request_uri", config)
+        self.assertIn("return 308 https://class01.example.com$request_uri", config)
+        self.assertNotIn("return 308 https://$host$request_uri", config)
         self.assertIn("listen 443 ssl", config)
         self.assertIn("ssl_certificate ", config)
         self.assertIn("ssl_certificate_key ", config)
@@ -328,6 +334,58 @@ class AuthenticationSecurityTests(unittest.TestCase):
             ).status_code,
             429,
         )
+
+    @patch("app.check_password_hash", return_value=False)
+    def test_login_rate_limit_normalizes_username_whitespace(self, _check_hash):
+        token = csrf_token(self.client)
+        for suffix_length in range(5):
+            response = self.client.post(
+                "/login",
+                data={
+                    "username": "admin" + (" " * suffix_length),
+                    "password": "wrong-password",
+                    "csrf_token": token,
+                },
+                base_url="https://localhost",
+            )
+            self.assertEqual(response.status_code, 401)
+
+        response = self.client.post(
+            "/login",
+            data={
+                "username": " admin ",
+                "password": "wrong-password",
+                "csrf_token": token,
+            },
+            base_url="https://localhost",
+        )
+        self.assertEqual(response.status_code, 429)
+
+    @patch("app.check_password_hash", return_value=False)
+    def test_login_rate_limits_rotating_usernames_by_ip(self, _check_hash):
+        token = csrf_token(self.client)
+        for index in range(10):
+            response = self.client.post(
+                "/login",
+                data={
+                    "username": f"missing-{index}",
+                    "password": "wrong-password",
+                    "csrf_token": token,
+                },
+                base_url="https://localhost",
+            )
+            self.assertEqual(response.status_code, 401)
+
+        response = self.client.post(
+            "/login",
+            data={
+                "username": "missing-final",
+                "password": "wrong-password",
+                "csrf_token": token,
+            },
+            base_url="https://localhost",
+        )
+        self.assertEqual(response.status_code, 429)
 
     def test_session_cookie_has_required_flags(self):
         response = self.login("alice", self.alice_password)
@@ -438,7 +496,7 @@ class RegistrationAndSearchTests(unittest.TestCase):
         self,
         client=None,
         username="reguser",
-        password="regpass123",
+        password="RegistrationPassword123",
         email="reg@test.com",
         phone="13800138001",
         csrf_token_val=None,
@@ -494,6 +552,15 @@ class RegistrationAndSearchTests(unittest.TestCase):
             },
             base_url="https://localhost",
         )
+        self.assertIn("密码长度", response.get_data(as_text=True))
+
+    def test_register_rejects_password_shorter_than_twelve_characters(self):
+        response = self.register(
+            username=self.unique_username("weakpwd"),
+            password="12345678901",
+        )
+
+        self.assertEqual(response.status_code, 200)
         self.assertIn("密码长度", response.get_data(as_text=True))
 
     def test_register_duplicate_username_is_rejected(self):
@@ -572,6 +639,19 @@ class RegistrationAndSearchTests(unittest.TestCase):
         # 参数化查询应拦截注入，搜索结果应为空或仅有匹配用户
         # ' OR 1=1-- 作为字面字符串搜索，不应匹配任何用户
         self.assertIn("无搜索结果", text)
+
+    def test_non_admin_cannot_map_private_email_to_username(self):
+        victim = self.unique_username("privacy")
+        private_email = "private-search-probe@example.invalid"
+        self.register(username=victim, email=private_email)
+        self.login("alice", self.alice_password)
+
+        response = self.client.get(
+            f"/search?keyword={private_email}", base_url="https://localhost"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(victim, response.get_data(as_text=True))
 
     def test_search_with_empty_keyword_returns_nothing(self):
         """空关键词搜索返回无结果"""
@@ -808,6 +888,81 @@ class UploadSecurityTests(unittest.TestCase):
         self.assertTrue(user_dir.exists(), "用户目录应存在")
         self.assertTrue(any(user_dir.iterdir()), "用户目录应有文件")
 
+    def test_upload_rejects_files_beyond_per_user_quota(self):
+        self.login()
+        user_dir = Path("static/uploads/admin")
+        user_dir.mkdir(parents=True, exist_ok=True)
+        (user_dir / "existing.png").write_bytes(self._minimal_png())
+        token = csrf_token(self.client, "/upload")
+
+        with (
+            patch("app.MAX_UPLOAD_FILES_PER_USER", 1, create=True),
+            patch("app.MAX_UPLOAD_BYTES_PER_USER", 1024, create=True),
+        ):
+            response = self.client.post(
+                "/upload",
+                data={
+                    "file": (io.BytesIO(self._minimal_png()), "second.png"),
+                    "csrf_token": token,
+                },
+                base_url="https://localhost",
+                content_type="multipart/form-data",
+            )
+
+        self.assertIn("存储配额", response.get_data(as_text=True))
+        self.assertEqual(len(list(user_dir.glob("*.png"))), 1)
+
+    def test_concurrent_uploads_cannot_exceed_per_user_quota(self):
+        clients = (self.app.test_client(), self.app.test_client())
+        for client in clients:
+            set_authenticated_session(self.app, client, "admin")
+        tokens = tuple(csrf_token(client, "/upload") for client in clients)
+        start = threading.Barrier(2)
+        original_usage = __import__("app")._upload_usage
+        errors = []
+
+        def slow_usage(directory):
+            usage = original_usage(directory)
+            time.sleep(0.1)
+            return usage
+
+        def upload(client, token, filename):
+            try:
+                start.wait(timeout=5)
+                client.post(
+                    "/upload",
+                    data={
+                        "file": (io.BytesIO(self._minimal_png()), filename),
+                        "csrf_token": token,
+                    },
+                    base_url="https://localhost",
+                    content_type="multipart/form-data",
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        with (
+            patch("app.MAX_UPLOAD_FILES_PER_USER", 1),
+            patch("app.MAX_UPLOAD_BYTES_PER_USER", 1024),
+            patch("app._upload_usage", side_effect=slow_usage),
+        ):
+            threads = (
+                threading.Thread(
+                    target=upload, args=(clients[0], tokens[0], "first.png")
+                ),
+                threading.Thread(
+                    target=upload, args=(clients[1], tokens[1], "second.png")
+                ),
+            )
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+        uploaded_files = list(Path("static/uploads/admin").glob("*.png"))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(uploaded_files), 1)
+
     @staticmethod
     def _minimal_png():
         """生成 1x1 红色像素 PNG"""
@@ -1013,6 +1168,30 @@ class AccessControlAndExternalFetchTests(unittest.TestCase):
         self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", text)
         self.assertNotIn("<script>alert(1)</script>", text)
 
+    @patch("app._fetch_https_once")
+    def test_fetch_page_rejects_non_unicast_addresses(self, pinned_fetch):
+        config = valid_config(self.store_path)
+        config["FETCH_ALLOWED_HOSTS"] = ("example.com",)
+        app = create_app(config)
+        app.logger.disabled = True
+        client = app.test_client()
+        set_authenticated_session(app, client, "admin")
+
+        for address in ("fec0::1", "ff05::1", "224.0.0.1"):
+            family = 10 if ":" in address else 2
+            socket_address = (address, 443, 0, 0) if family == 10 else (address, 443)
+            with patch(
+                "app.socket.getaddrinfo",
+                return_value=[(family, 1, 6, "", socket_address)],
+            ):
+                response = client.get(
+                    "/fetch-page?url=https://example.com/",
+                    base_url="https://localhost",
+                )
+            self.assertEqual(response.status_code, 403)
+
+        pinned_fetch.assert_not_called()
+
 
 class PingDiagnosticsTests(unittest.TestCase):
     @classmethod
@@ -1064,6 +1243,22 @@ class PingDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("有效的公网 IP", response.get_data(as_text=True))
+        run.assert_not_called()
+
+    @patch("app.subprocess.run")
+    def test_ping_rejects_multicast_and_site_local_addresses(self, run):
+        self.login_as()
+        token = csrf_token(self.client, "/ping")
+        run.return_value = Mock(returncode=0, stdout="", stderr="")
+
+        for target in ("224.0.0.1", "ff02::1%eth0", "ff05::1%eth0", "fec0::1"):
+            response = self.client.post(
+                "/ping",
+                data={"ip": target, "csrf_token": token},
+                base_url="https://localhost",
+            )
+            self.assertEqual(response.status_code, 400)
+
         run.assert_not_called()
 
     @patch("app.platform.system", return_value="Linux")
@@ -1159,6 +1354,27 @@ class CredentialChangeTests(unittest.TestCase):
                 "current_password": "incorrect",
                 "new_password": "new-password-123",
                 "confirm_password": "new-password-123",
+                "csrf_token": token,
+            },
+            base_url="https://localhost",
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            self.app.extensions["users"]["alice"]["password_hash"], original_hash
+        )
+
+    def test_change_password_rejects_password_shorter_than_twelve_characters(self):
+        original_hash = self.app.extensions["users"]["alice"]["password_hash"]
+        token = csrf_token(self.client, "/profile")
+
+        response = self.client.post(
+            "/change-password",
+            data={
+                "username": "alice",
+                "current_password": self.alice_password,
+                "new_password": "12345678901",
+                "confirm_password": "12345678901",
                 "csrf_token": token,
             },
             base_url="https://localhost",

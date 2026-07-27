@@ -2,7 +2,7 @@ server {
     listen 80;
     server_name class01.example.com;
 
-    return 308 https://$host$request_uri;
+    return 308 https://class01.example.com$request_uri;
 }
 
 server {

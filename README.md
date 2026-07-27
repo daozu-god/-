@@ -21,6 +21,15 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
+`requirements.txt` 固定全部传递依赖并包含 SHA-256 哈希；直接依赖维护在
+`requirements.in`。更新依赖时重新生成锁定文件：
+
+```bash
+uv pip compile requirements.in --generate-hashes \
+  --python-version 3.10 --python-platform x86_64-unknown-linux-gnu \
+  --output-file requirements.txt
+```
+
 建议使用独立的低权限系统账户运行服务，并确保该账户不能修改应用源码。
 
 ## 配置运行密钥
@@ -53,7 +62,7 @@ FETCH_ALLOWED_HOSTS=example.com
 不要把 `.env` 提交到 Git，也不要在不同环境复用会话密钥。应用会拒绝空值和少于 32 个字符的密钥。
 `APP_ENV=production` 会启用 HTTPS 安全 Cookie 与严格 CSRF 校验；应用在未配置该变量时也默认采用生产安全设置。仅在明确的本地 HTTP 开发环境中使用 `APP_ENV=development`。
 
-`FETCH_ALLOWED_HOSTS` 是可选的、以逗号分隔的 HTTPS 主机白名单。未配置时，`/fetch-page` 默认拒绝所有外部页面抓取；配置的主机仍必须解析为全局公网地址。
+`FETCH_ALLOWED_HOSTS` 是可选的、以逗号分隔的 HTTPS 主机白名单。未配置时，`/fetch-page` 默认拒绝所有外部页面抓取；配置的主机仍必须解析为公网单播地址，组播、站点本地、链路本地和保留地址都会被拒绝。
 
 ## 一次性初始化账户密码
 
@@ -146,6 +155,7 @@ scripts/               Nginx/TLS 与 Linux 权限动态复测脚本
 templates/             Jinja 页面模板
 static/css/            页面样式
 tests/                 安全回归测试
-requirements.txt       固定的直接依赖
+requirements.in        直接依赖来源
+requirements.txt       带 SHA-256 哈希的完整依赖锁定文件
 .env.example           运行期环境变量模板，不含账户密码
 ```

@@ -35,6 +35,7 @@ from credential_store import (
     load_password_hashes,
     update_password_hash,
 )
+from secure_files import exclusive_file_lock
 
 
 PUBLIC_USER_FIELDS = ("username", "email", "phone", "role", "balance")
@@ -62,8 +63,11 @@ SECURITY_POLICY = (
 # 允许上传的图片文件扩展名
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "bmp", "webp", "ico"}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB 单文件限制
+MAX_UPLOAD_FILES_PER_USER = 20
+MAX_UPLOAD_BYTES_PER_USER = 25 * 1024 * 1024
 MAX_PING_OUTPUT = 8 * 1024
 MAX_FETCH_BYTES = 256 * 1024
+MIN_PASSWORD_LENGTH = 12
 DATABASE_PATH = Path(__file__).resolve().parent / "data" / "users.db"
 PAGES_DIRECTORY = Path(__file__).resolve().parent / "pages"
 
@@ -91,6 +95,33 @@ def _matches_image_signature(extension, header):
     return any(
         header.startswith(signature) for signature in IMAGE_MAGIC_MAP.get(extension, ())
     )
+
+
+def _is_public_unicast_address(address):
+    return not any(
+        (
+            not address.is_global,
+            address.is_multicast,
+            address.is_reserved,
+            address.is_unspecified,
+            address.is_loopback,
+            address.is_link_local,
+            getattr(address, "is_site_local", False),
+            bool(getattr(address, "scope_id", None)),
+        )
+    )
+
+
+def _upload_usage(directory):
+    file_count = 0
+    total_bytes = 0
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if entry.name.startswith(".") or not entry.is_file(follow_symlinks=False):
+                continue
+            file_count += 1
+            total_bytes += entry.stat(follow_symlinks=False).st_size
+    return file_count, total_bytes
 
 
 def _safe_log_value(value, max_length=160):
@@ -309,11 +340,18 @@ def create_app(test_config=None):
     # 初始化 SQLite 数据库
     init_db()
 
+    def current_builtin_password_hash(username):
+        if username not in users:
+            return None
+        try:
+            return load_password_hashes(app.config["USER_STORE_PATH"])[username]
+        except (KeyError, RuntimeError):
+            return None
+
     def credential_version_for(username):
         password_hash = None
-        user = users.get(username)
-        if user:
-            password_hash = user["password_hash"]
+        if username in users:
+            password_hash = current_builtin_password_hash(username)
         else:
             try:
                 with closing(sqlite3.connect(DATABASE_PATH, timeout=5)) as conn:
@@ -352,7 +390,7 @@ def create_app(test_config=None):
         return None
 
     def login_rate_limit_key():
-        username = request.form.get("username", "")[:64].casefold()
+        username = request.form.get("username", "").strip()[:64].casefold()
         return f"{get_remote_address()}:{username}"
 
     limiter = Limiter(
@@ -549,7 +587,7 @@ def create_app(test_config=None):
                 error = "请输入有效的公网 IP 地址"
                 status_code = 400
             else:
-                if not parsed_ip.is_global:
+                if not _is_public_unicast_address(parsed_ip):
                     error = "仅允许测试公网 IP 地址"
                     status_code = 400
                 else:
@@ -595,6 +633,7 @@ def create_app(test_config=None):
         ), status_code
 
     @app.route("/login", methods=["GET", "POST"])
+    @limiter.limit("10 per minute", key_func=get_remote_address, methods=["POST"])
     @limiter.limit(
         "5 per minute",
         key_func=login_rate_limit_key,
@@ -618,7 +657,8 @@ def create_app(test_config=None):
 
         # 第一步：JSON 凭据（admin/alice）
         user = users.get(username)
-        json_hash = user["password_hash"] if user else dummy_hash
+        current_json_hash = current_builtin_password_hash(username)
+        json_hash = current_json_hash if current_json_hash else dummy_hash
         json_match = user is not None and check_password_hash(json_hash, password)
         if user is None:
             check_password_hash(json_hash, password)
@@ -679,9 +719,10 @@ def create_app(test_config=None):
                 return render_template("register.html", error="用户名包含非法字符")
             if username in users:
                 return render_template("register.html", error="用户名已存在")
-            if not 6 <= len(password) <= 128:
+            if not MIN_PASSWORD_LENGTH <= len(password) <= 128:
                 return render_template(
-                    "register.html", error="密码长度须为 6-128 个字符"
+                    "register.html",
+                    error=f"密码长度须为 {MIN_PASSWORD_LENGTH}-128 个字符",
                 )
             if len(email) > 128:
                 return render_template("register.html", error="邮箱地址过长")
@@ -735,15 +776,24 @@ def create_app(test_config=None):
                     .replace("_", "\\_")
                 )
                 search_pattern = f"%{escaped_keyword}%"
+                can_search_email = users.get(username, {}).get("role") == "admin"
                 with closing(sqlite3.connect(DATABASE_PATH, timeout=5)) as conn:
                     cursor = conn.cursor()
-                    cursor.execute(
-                        "SELECT id, username FROM users "
-                        "WHERE username LIKE ? ESCAPE '\\' "
-                        "OR email LIKE ? ESCAPE '\\' "
-                        "ORDER BY username LIMIT 50",
-                        (search_pattern, search_pattern),
-                    )
+                    if can_search_email:
+                        cursor.execute(
+                            "SELECT id, username FROM users "
+                            "WHERE username LIKE ? ESCAPE '\\' "
+                            "OR email LIKE ? ESCAPE '\\' "
+                            "ORDER BY username LIMIT 50",
+                            (search_pattern, search_pattern),
+                        )
+                    else:
+                        cursor.execute(
+                            "SELECT id, username FROM users "
+                            "WHERE username LIKE ? ESCAPE '\\' "
+                            "ORDER BY username LIMIT 50",
+                            (search_pattern,),
+                        )
                     rows = cursor.fetchall()
                 for row in rows:
                     results.append(
@@ -774,6 +824,7 @@ def create_app(test_config=None):
             user=public_user,
             search_results=results,
             keyword=keyword,
+            search_supports_email=users.get(username, {}).get("role") == "admin",
             page_content=None,
             page_error=None,
         )
@@ -829,39 +880,64 @@ def create_app(test_config=None):
                             if file_size > MAX_FILE_SIZE:
                                 error = f"文件过大（{file_size / 1024 / 1024:.1f}MB），最大允许 5MB"
                             else:
-                                open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                                open_flags |= getattr(os, "O_NOFOLLOW", 0)
-                                try:
-                                    descriptor = os.open(save_path, open_flags, 0o644)
-                                except FileExistsError:
-                                    error = "文件名冲突，请重试"
-                                except OSError:
-                                    error = "文件保存失败"
-                                else:
+                                quota_lock = os.path.join(user_dir, ".upload.lock")
+                                with exclusive_file_lock(quota_lock):
                                     try:
-                                        with os.fdopen(descriptor, "wb") as output_file:
-                                            file.save(output_file)
+                                        existing_count, existing_bytes = _upload_usage(
+                                            user_dir
+                                        )
                                     except OSError:
-                                        try:
-                                            os.unlink(save_path)
-                                        except OSError:
-                                            pass
-                                        error = "文件保存失败"
+                                        error = "无法检查上传存储配额"
                                     else:
-                                        os.chmod(save_path, 0o644)
-                                        uploaded_url = url_for(
-                                            "static",
-                                            filename=(
-                                                f"uploads/{safe_username}/{unique_name}"
-                                            ),
+                                        quota_exceeded = (
+                                            existing_count >= MAX_UPLOAD_FILES_PER_USER
+                                            or existing_bytes + file_size
+                                            > MAX_UPLOAD_BYTES_PER_USER
                                         )
-                                        app.logger.info(
-                                            "upload_success username=%s original=%s saved=%s size=%d",
-                                            username,
-                                            _safe_log_value(safe_name),
-                                            unique_name,
-                                            file_size,
-                                        )
+                                        if quota_exceeded:
+                                            error = "上传存储配额已用尽，请先清理旧文件"
+                                        else:
+                                            open_flags = (
+                                                os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                            )
+                                            open_flags |= getattr(os, "O_NOFOLLOW", 0)
+                                            try:
+                                                descriptor = os.open(
+                                                    save_path, open_flags, 0o644
+                                                )
+                                            except FileExistsError:
+                                                error = "文件名冲突，请重试"
+                                            except OSError:
+                                                error = "文件保存失败"
+                                            else:
+                                                try:
+                                                    with os.fdopen(
+                                                        descriptor, "wb"
+                                                    ) as output_file:
+                                                        file.save(output_file)
+                                                except OSError:
+                                                    try:
+                                                        os.unlink(save_path)
+                                                    except OSError:
+                                                        pass
+                                                    error = "文件保存失败"
+                                                else:
+                                                    os.chmod(save_path, 0o644)
+                                                    uploaded_url = url_for(
+                                                        "static",
+                                                        filename=(
+                                                            "uploads/"
+                                                            f"{safe_username}/"
+                                                            f"{unique_name}"
+                                                        ),
+                                                    )
+                                                    app.logger.info(
+                                                        "upload_success username=%s original=%s saved=%s size=%d",
+                                                        username,
+                                                        _safe_log_value(safe_name),
+                                                        unique_name,
+                                                        file_size,
+                                                    )
 
         return render_template("upload.html", uploaded_url=uploaded_url, error=error)
 
@@ -1047,13 +1123,17 @@ def create_app(test_config=None):
         if username != current_user:
             return redirect(url_for("profile"))
 
-        if not 6 <= len(new_password) <= 128 or new_password != confirm_password:
+        if (
+            not MIN_PASSWORD_LENGTH <= len(new_password) <= 128
+            or new_password != confirm_password
+        ):
             return redirect(url_for("profile"))
 
         # 更新 JSON 用户
         if username in users:
-            if not check_password_hash(
-                users[username]["password_hash"], current_password
+            current_password_hash = current_builtin_password_hash(username)
+            if not current_password_hash or not check_password_hash(
+                current_password_hash, current_password
             ):
                 return redirect(url_for("profile"))
             new_password_hash = generate_password_hash(new_password, method="scrypt")
@@ -1135,7 +1215,7 @@ def create_app(test_config=None):
                     ip = ipaddress.ip_address(info[4][0])
                     if ip.version == 6 and ip.ipv4_mapped:
                         ip = ip.ipv4_mapped
-                    if not ip.is_global:
+                    if not _is_public_unicast_address(ip):
                         return ()
                     canonical_ip = str(ip)
                     if canonical_ip not in resolved:

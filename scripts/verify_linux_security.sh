@@ -3,21 +3,27 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d)"
+WORK_DIR="$TMP_DIR/repo"
 
 cleanup() {
     rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
 
+mkdir -p "$WORK_DIR"
+git -C "$ROOT_DIR" ls-files -co --exclude-standard -z \
+    | tar -C "$ROOT_DIR" --null --files-from=- -cf - \
+    | tar -C "$WORK_DIR" -xf -
+
 python3 -m venv "$TMP_DIR/venv"
-"$TMP_DIR/venv/bin/pip" install --quiet --requirement "$ROOT_DIR/requirements.txt"
+"$TMP_DIR/venv/bin/pip" install --quiet --requirement "$WORK_DIR/requirements.txt"
 
 ADMIN_INITIAL_PASSWORD="$($TMP_DIR/venv/bin/python -c 'import secrets; print(secrets.token_urlsafe(24))')"
 ALICE_INITIAL_PASSWORD="$($TMP_DIR/venv/bin/python -c 'import secrets; print(secrets.token_urlsafe(24))')"
 export ADMIN_INITIAL_PASSWORD ALICE_INITIAL_PASSWORD
 export USER_STORE_PATH="$TMP_DIR/users.json"
 
-cd "$ROOT_DIR"
+cd "$WORK_DIR"
 "$TMP_DIR/venv/bin/python" init_users.py >/dev/null
 
 STORE_MODE="$(stat -c '%a' "$USER_STORE_PATH")"

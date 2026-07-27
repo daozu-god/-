@@ -19,16 +19,18 @@
 import argparse
 import base64
 import csv
+import getpass
 import json
 import os
 import sys
-import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 import requests
+
+from secure_files import atomic_private_text_writer, exclusive_file_lock
 
 # ============================================================================
 #  配置区域（可修改）
@@ -62,32 +64,10 @@ def base64_url_encode(text: str) -> str:
     return encoded.rstrip("=")
 
 
-def _write_private_json(path: str, payload: dict):
-    destination = Path(path)
-    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.",
-        suffix=".tmp",
-        dir=destination.parent,
-        text=True,
-    )
-    temporary_path = Path(temporary_name)
-    try:
-        os.chmod(temporary_path, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as output_file:
-            json.dump(payload, output_file, ensure_ascii=False, indent=2)
-            output_file.write("\n")
-            output_file.flush()
-            os.fsync(output_file.fileno())
-        os.replace(temporary_path, destination)
-        os.chmod(destination, 0o600)
-    except BaseException:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
-        temporary_path.unlink(missing_ok=True)
-        raise
+def _write_private_json(path: str, payload):
+    with atomic_private_text_writer(path) as output_file:
+        json.dump(payload, output_file, ensure_ascii=False, indent=2)
+        output_file.write("\n")
 
 
 def _request_hunter(url, *, params, headers, timeout):
@@ -146,7 +126,7 @@ class HunterFetcher:
         """保存配额使用状态到本地文件"""
         self.state["last_update"] = datetime.now().isoformat()
         _write_private_json(STATE_FILE, self.state)
-        print(f"[✓] 状态已保存至 {STATE_FILE}")
+        print(f"[OK] 状态已保存至 {STATE_FILE}")
 
     @property
     def remaining_quota(self) -> int:
@@ -158,6 +138,28 @@ class HunterFetcher:
     # ------------------------------------------------------------------
 
     def search(
+        self,
+        query: str,
+        page: int = 1,
+        page_size: int = DEFAULT_PAGE_SIZE,
+        is_web: int = 1,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+    ) -> dict:
+        state_path = Path(STATE_FILE)
+        lock_path = state_path.with_name(f".{state_path.name}.lock")
+        with exclusive_file_lock(lock_path):
+            self.state = self._load_state()
+            return self._search_locked(
+                query=query,
+                page=page,
+                page_size=page_size,
+                is_web=is_web,
+                start_time=start_time,
+                end_time=end_time,
+            )
+
+    def _search_locked(
         self,
         query: str,
         page: int = 1,
@@ -235,7 +237,7 @@ class HunterFetcher:
                 self._save_state()
 
                 print(
-                    f"[✓] 成功获取 {actual_returned} 条数据 | "
+                    f"[OK] 成功获取 {actual_returned} 条数据 | "
                     f"剩余配额: {self.remaining_quota} 条"
                 )
             else:
@@ -244,7 +246,7 @@ class HunterFetcher:
             return data
 
         except requests.exceptions.RequestException:
-            print("[✗] 请求失败，请检查网络或 API 凭据")
+            print("[ERROR] 请求失败，请检查网络或 API 凭据")
             return {"code": -1, "message": "请求失败"}
 
     def search_all_pages(
@@ -325,7 +327,7 @@ class HunterFetcher:
                 print("[!] 翻页失败，提前停止")
                 break
 
-        print(f"[✓] 翻页完成，共获取 {len(all_results)} 条数据")
+        print(f"[OK] 翻页完成，共获取 {len(all_results)} 条数据")
         return all_results
 
     # ------------------------------------------------------------------
@@ -334,9 +336,8 @@ class HunterFetcher:
 
     def export_json(self, data: list, filename: str = "hunter_results.json"):
         """导出为 JSON 文件"""
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        print(f"[✓] 已导出 JSON: {filename} ({len(data)} 条)")
+        _write_private_json(filename, data)
+        print(f"[OK] 已导出 JSON: {filename} ({len(data)} 条)")
 
     def export_csv(self, data: list, filename: str = "hunter_results.csv"):
         """导出为 CSV 文件"""
@@ -346,14 +347,16 @@ class HunterFetcher:
 
         # 从第一条数据提取字段名
         fieldnames = list(data[0].keys())
-        with open(filename, "w", encoding="utf-8-sig", newline="") as f:
+        with atomic_private_text_writer(
+            filename, encoding="utf-8-sig", newline=""
+        ) as f:
             writer = csv.writer(f)
             writer.writerow(_csv_text(fieldname) for fieldname in fieldnames)
             for row in data:
                 writer.writerow(
                     _csv_text(row.get(fieldname)) for fieldname in fieldnames
                 )
-        print(f"[✓] 已导出 CSV: {filename} ({len(data)} 条)")
+        print(f"[OK] 已导出 CSV: {filename} ({len(data)} 条)")
 
     def print_results(self, data: list):
         """在终端打印结果"""
@@ -383,7 +386,7 @@ def parse_args():
         epilog="""
 使用示例:
   # 设置 API Key（首次使用）
-  python hunter_fetcher.py --set-key YOUR_API_KEY
+  python hunter_fetcher.py --set-key
 
   # 执行单次搜索（默认每页 10 条）
   python hunter_fetcher.py --search 'ip="1.1.1.1"'
@@ -411,15 +414,13 @@ def parse_args():
     # API Key 配置
     parser.add_argument(
         "--set-key",
-        type=str,
-        metavar="API_KEY",
-        help="设置 API Key 并保存到本地配置文件",
+        action="store_true",
+        help="安全提示输入 API Key 并保存到本地配置文件",
     )
     parser.add_argument(
         "--key",
-        type=str,
-        metavar="API_KEY",
-        help="临时使用此 API Key（不保存）",
+        action="store_true",
+        help="安全提示输入临时 API Key（不保存）",
     )
 
     # 搜索参数
@@ -521,9 +522,13 @@ def main():
     #  功能 1: 设置 API Key
     # ------------------------------------------------------------------
     if args.set_key:
-        config = {"api_key": args.set_key}
+        api_key = getpass.getpass("Hunter API Key: ").strip()
+        if not api_key:
+            print("[!] API Key 不能为空")
+            return 1
+        config = {"api_key": api_key}
         _write_private_json(config_file, config)
-        print(f"[✓] API Key 已保存至 {config_file}（权限: 600）")
+        print(f"[OK] API Key 已保存至 {config_file}（权限: 600）")
         return
 
     # ------------------------------------------------------------------
@@ -560,7 +565,11 @@ def main():
         sys.exit(1)
 
     # --- 加载 API Key ---
-    api_key = args.key or os.getenv("HUNTER_API_KEY")
+    api_key = None
+    if args.key:
+        api_key = getpass.getpass("Hunter API Key: ").strip()
+    if not api_key:
+        api_key = os.getenv("HUNTER_API_KEY")
     if not api_key:
         if os.path.exists(config_file):
             try:
@@ -572,14 +581,14 @@ def main():
 
     if not api_key:
         print("[!] 未设置 API Key！")
-        print("    请先运行: python hunter_fetcher.py --set-key YOUR_KEY")
-        print("    或使用:   python hunter_fetcher.py --key YOUR_KEY --search ...")
+        print("    请先运行: python hunter_fetcher.py --set-key")
+        print("    或使用:   python hunter_fetcher.py --key --search ...")
         sys.exit(1)
 
     # --- 校验 page_size 硬性限制 ---
     if args.page_size != DEFAULT_PAGE_SIZE and not args.force_size:
         print(f"\n{'=' * 60}")
-        print(f"  ⛔ 每页条数被限制为 {DEFAULT_PAGE_SIZE} 条（硬性限制）")
+        print(f"  [BLOCKED] 每页条数被限制为 {DEFAULT_PAGE_SIZE} 条（硬性限制）")
         print(f"  你请求了 page-size={args.page_size}，但未使用 --force-size 参数。")
         print(f"  如需修改请确认后重新运行: --page-size {args.page_size} --force-size")
         print(f"{'=' * 60}\n")
@@ -588,7 +597,9 @@ def main():
 
     if args.force_size and args.page_size != DEFAULT_PAGE_SIZE:
         print(f"\n{'!' * 60}")
-        print(f"  ⚠️  你已使用 --force-size，将 page-size 修改为 {args.page_size}")
+        print(
+            f"  [WARNING] 你已使用 --force-size，将 page-size 修改为 {args.page_size}"
+        )
         print(
             f"  注意: 这将加速消耗配额（剩余 {MAX_TOTAL_QUOTA - HunterFetcher(api_key=api_key)._load_state()['used_quota']} 条）"
         )
@@ -645,4 +656,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

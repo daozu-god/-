@@ -41,7 +41,7 @@
         <div class="search-section">
             <form method="GET" action="{{ url_for('search') }}" class="search-form">
                 <div class="search-group">
-                    <input type="text" name="keyword" class="form-input search-input" placeholder="搜索用户（用户名/邮箱）" value="{{ keyword }}" required>
+                    <input type="text" name="keyword" class="form-input search-input" placeholder="{% if search_supports_email | default(false) %}搜索用户（用户名/邮箱）{% else %}搜索用户（用户名）{% endif %}" value="{{ keyword }}" maxlength="128" required>
                     <button type="submit" class="btn btn-primary search-btn">搜索</button>
                 </div>
             </form>

@@ -1,9 +1,11 @@
 import json
 import os
-import tempfile
+import stat
 from pathlib import Path
 
 from werkzeug.security import generate_password_hash
+
+from secure_files import atomic_private_text_writer, exclusive_file_lock
 
 
 ACCOUNT_NAMES = ("admin", "alice")
@@ -24,6 +26,9 @@ def initialize_password_store(path, admin_password, alice_password):
 
     store_path = Path(path)
     store_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if store_path.parent.is_symlink():
+        raise RuntimeError("password store directory must not be a symbolic link")
+    os.chmod(store_path.parent, 0o700)
     payload = {
         "version": STORE_VERSION,
         "password_hashes": {
@@ -58,7 +63,15 @@ def initialize_password_store(path, admin_password, alice_password):
 
 def load_password_hashes(path):
     store_path = Path(path)
+    if store_path.is_symlink():
+        raise RuntimeError("password store must not be a symbolic link")
     try:
+        store_stat = store_path.stat()
+        if os.name == "posix":
+            if store_stat.st_uid != os.geteuid():
+                raise RuntimeError("password store must be owned by the service user")
+            if stat.S_IMODE(store_stat.st_mode) & 0o077:
+                raise RuntimeError("password store permissions must be 0600")
         payload = json.loads(store_path.read_text(encoding="utf-8"))
     except FileNotFoundError as error:
         raise RuntimeError(
@@ -96,32 +109,13 @@ def update_password_hash(path, username, password_hash):
         raise RuntimeError("password hash is invalid")
 
     store_path = Path(path)
-    password_hashes = load_password_hashes(store_path)
-    payload = {
-        "version": STORE_VERSION,
-        "password_hashes": {**password_hashes, username: password_hash},
-    }
-    store_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{store_path.name}.",
-        suffix=".tmp",
-        dir=store_path.parent,
-        text=True,
-    )
-    temporary_path = Path(temporary_name)
-    try:
-        os.chmod(temporary_path, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as store_file:
+    lock_path = store_path.with_name(f".{store_path.name}.lock")
+    with exclusive_file_lock(lock_path):
+        password_hashes = load_password_hashes(store_path)
+        payload = {
+            "version": STORE_VERSION,
+            "password_hashes": {**password_hashes, username: password_hash},
+        }
+        with atomic_private_text_writer(store_path) as store_file:
             json.dump(payload, store_file, indent=2, sort_keys=True)
             store_file.write("\n")
-            store_file.flush()
-            os.fsync(store_file.fileno())
-        os.replace(temporary_path, store_path)
-        os.chmod(store_path, 0o600)
-    except BaseException:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
-        temporary_path.unlink(missing_ok=True)
-        raise

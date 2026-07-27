@@ -5,6 +5,8 @@ import secrets
 import sqlite3
 import stat
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import closing, redirect_stdout
 from pathlib import Path
@@ -15,6 +17,7 @@ import requests
 from werkzeug.security import check_password_hash, generate_password_hash
 
 import app as app_module
+import credential_store
 import hunter_fetcher
 from tests.test_security import (
     csrf_token,
@@ -158,6 +161,95 @@ class CredentialPersistenceTests(unittest.TestCase):
             persisted_hash = restarted.extensions["users"]["alice"]["password_hash"]
             self.assertTrue(check_password_hash(persisted_hash, new_password))
             self.assertFalse(check_password_hash(persisted_hash, old_password))
+
+    def test_preexisting_app_instance_rejects_old_builtin_password(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = Path(temp_dir) / "users.json"
+            old_password = secrets.token_urlsafe(24)
+            new_password = secrets.token_urlsafe(24)
+            write_password_store(store_path, secrets.token_urlsafe(24), old_password)
+            config = valid_config(store_path)
+            first_app = app_module.create_app(config)
+            second_app = app_module.create_app(config)
+            first_app.logger.disabled = True
+            second_app.logger.disabled = True
+            first_client = first_app.test_client()
+            second_client = second_app.test_client()
+            set_authenticated_session(first_app, first_client, "alice")
+            token = csrf_token(first_client, "/profile")
+
+            first_client.post(
+                "/change-password",
+                data={
+                    "username": "alice",
+                    "current_password": old_password,
+                    "new_password": new_password,
+                    "confirm_password": new_password,
+                    "csrf_token": token,
+                },
+                base_url="https://localhost",
+            )
+
+            login_token = csrf_token(second_client)
+            old_login = second_client.post(
+                "/login",
+                data={
+                    "username": "alice",
+                    "password": old_password,
+                    "csrf_token": login_token,
+                },
+                base_url="https://localhost",
+            )
+
+        self.assertEqual(old_login.status_code, 401)
+
+    def test_concurrent_builtin_password_updates_preserve_both_changes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = Path(temp_dir) / "users.json"
+            credential_store.initialize_password_store(
+                store_path,
+                "InitialAdminPassword!",
+                "InitialAlicePassword!",
+            )
+            original_load = credential_store.load_password_hashes
+            start = threading.Barrier(2)
+            errors = []
+            admin_hash = generate_password_hash(
+                "UpdatedAdminPassword!", method="scrypt"
+            )
+            alice_hash = generate_password_hash(
+                "UpdatedAlicePassword!", method="scrypt"
+            )
+
+            def slow_load(path):
+                password_hashes = original_load(path)
+                time.sleep(0.1)
+                return password_hashes
+
+            def update(username, password_hash):
+                try:
+                    start.wait(timeout=5)
+                    credential_store.update_password_hash(
+                        store_path, username, password_hash
+                    )
+                except BaseException as error:
+                    errors.append(error)
+
+            with patch("credential_store.load_password_hashes", slow_load):
+                threads = (
+                    threading.Thread(target=update, args=("admin", admin_hash)),
+                    threading.Thread(target=update, args=("alice", alice_hash)),
+                )
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=10)
+
+            final_hashes = original_load(store_path)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(final_hashes["admin"], admin_hash)
+        self.assertEqual(final_hashes["alice"], alice_hash)
 
 
 class SessionInvalidationTests(unittest.TestCase):
@@ -489,6 +581,91 @@ class HunterFetcherSecurityTests(unittest.TestCase):
 
         self.assertIn("'=HYPERLINK", exported)
         self.assertNotIn('\n"=HYPERLINK', exported)
+
+    def test_exports_are_forced_to_private_permissions(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            json_path = Path(temp_dir) / "results.json"
+            csv_path = Path(temp_dir) / "results.csv"
+            fetcher = hunter_fetcher.HunterFetcher("unused")
+            with (
+                patch("hunter_fetcher.os.chmod", wraps=os.chmod) as chmod,
+                redirect_stdout(io.StringIO()),
+            ):
+                fetcher.export_json([{"host": "example.invalid"}], str(json_path))
+                fetcher.export_csv([{"host": "example.invalid"}], str(csv_path))
+
+        private_destinations = {
+            Path(call.args[0])
+            for call in chmod.call_args_list
+            if len(call.args) == 2 and call.args[1] == 0o600
+        }
+        self.assertIn(json_path, private_destinations)
+        self.assertIn(csv_path, private_destinations)
+
+    def test_concurrent_searches_preserve_quota_and_history(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            start = threading.Barrier(2)
+            errors = []
+
+            def fake_request(*_args, **_kwargs):
+                time.sleep(0.1)
+                response = Mock()
+                response.raise_for_status.return_value = None
+                response.json.return_value = {
+                    "code": 200,
+                    "data": {"arr": [{"host": index} for index in range(10)]},
+                }
+                return response
+
+            def search(fetcher):
+                try:
+                    start.wait(timeout=5)
+                    with redirect_stdout(io.StringIO()):
+                        fetcher.search("domain=example.invalid")
+                except BaseException as error:
+                    errors.append(error)
+
+            with (
+                patch.object(hunter_fetcher, "STATE_FILE", str(state_path)),
+                patch("hunter_fetcher._request_hunter", side_effect=fake_request),
+            ):
+                fetchers = (
+                    hunter_fetcher.HunterFetcher("unused"),
+                    hunter_fetcher.HunterFetcher("unused"),
+                )
+                threads = tuple(
+                    threading.Thread(target=search, args=(fetcher,))
+                    for fetcher in fetchers
+                )
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=10)
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(errors, [])
+        self.assertEqual(state["used_quota"], 20)
+        self.assertEqual(len(state["search_history"]), 2)
+
+    def test_api_key_options_do_not_accept_command_line_secrets(self):
+        with patch.object(
+            __import__("sys"),
+            "argv",
+            ["hunter_fetcher.py", "--key", "secret-value", "--search", "test"],
+        ):
+            with self.assertRaises(SystemExit):
+                hunter_fetcher.parse_args()
+
+        with patch.object(
+            __import__("sys"),
+            "argv",
+            ["hunter_fetcher.py", "--key", "--search", "test"],
+        ):
+            args = hunter_fetcher.parse_args()
+
+        self.assertTrue(args.key)
 
 
 if __name__ == "__main__":
