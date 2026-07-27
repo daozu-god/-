@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="card">
+    <h1 class="card-title">Ping 测试</h1>
+    <form method="POST" action="{{ url_for('ping') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label for="ping-ip">IP 地址</label>
+        <input id="ping-ip" name="ip" type="text" class="form-input" value="{{ ip }}" placeholder="例如 8.8.8.8" inputmode="numeric" autocomplete="off" required>
+        <button type="submit" class="btn btn-primary">Ping</button>
+    </form>
+
+    {% if error %}
+        <div class="error-message" role="alert">{{ error }}</div>
+    {% endif %}
+    {% if output is not none %}
+        <pre class="ping-console" aria-label="Ping 执行结果">{{ output }}</pre>
+    {% endif %}
+</section>
+{% endblock %}

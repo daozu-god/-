@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="card">
+    <h2 class="card-title">个人中心</h2>
+
+    {% if error %}
+        <div class="error-message">{{ error }}</div>
+    {% endif %}
+
+    {% if user %}
+        <div class="user-info">
+            <h3>用户资料</h3>
+            <ul class="info-list">
+                <li><span class="info-label">ID：</span>{{ user.id }}</li>
+                <li><span class="info-label">用户名：</span>{{ user.username }}</li>
+                <li><span class="info-label">邮箱：</span>{{ user.email }}</li>
+                <li><span class="info-label">手机：</span>{{ user.phone }}</li>
+                <li><span class="info-label">余额：</span>{{ user.balance }}</li>
+            </ul>
+        </div>
+
+        <div class="recharge-section">
+            <h3>充值</h3>
+            <p class="status-note">支付服务暂未启用。余额仅会在已验证的支付回调完成后更新。</p>
+        </div>
+
+        <div class="recharge-section">
+            <h3>修改密码</h3>
+            <form method="POST" action="{{ url_for('change_password') }}" class="login-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="username" value="{{ user.username }}">
+                <div class="form-group">
+                    <label for="current_password">当前密码</label>
+                    <input type="password" id="current_password" name="current_password" class="form-input" autocomplete="current-password" required>
+                </div>
+                <div class="form-group">
+                    <label for="new_password">新密码</label>
+                    <input type="password" id="new_password" name="new_password" class="form-input" placeholder="请输入新密码" minlength="6" required>
+                </div>
+                <div class="form-group">
+                    <label for="confirm_password">确认密码</label>
+                    <input type="password" id="confirm_password" name="confirm_password" class="form-input" placeholder="请再次输入新密码" required>
+                </div>
+                <button type="submit" class="btn btn-primary">修改密码</button>
+            </form>
+        </div>
+    {% endif %}
+
+    <p style="margin-top: 20px; text-align: center;">
+        <a href="{{ url_for('index') }}">返回首页</a>
+    </p>
+</div>
+{% endblock %}

@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+{% if page_content is defined and page_content is not none %}
+    <div class="card page-content-card">
+        {% if page_is_external | default(false) %}
+            <iframe
+                title="外部页面预览"
+                sandbox
+                srcdoc="{{ page_content }}"
+                style="width: 100%; min-height: 480px; border: 0;"
+            ></iframe>
+        {% else %}
+            {{ page_content | safe }}
+        {% endif %}
+        <p style="margin-top: 20px; text-align: center;">
+            <a href="{{ url_for('index') }}">返回首页</a>
+        </p>
+    </div>
+{% elif page_error is defined and page_error %}
+    <div class="card">
+        <div class="error-message">{{ page_error }}</div>
+        <p style="margin-top: 20px; text-align: center;">
+            <a href="{{ url_for('index') }}">返回首页</a>
+        </p>
+    </div>
+{% elif username %}
+    <div class="card">
+        <h2 class="card-title">欢迎回来，{{ username }}！</h2>
+
+        <!-- 快捷入口 -->
+        <div style="margin-bottom: 16px; text-align: center; display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;">
+            <a href="{{ url_for('ping') }}" class="btn btn-primary" style="width: auto; display: inline-block; padding: 8px 24px;">Ping测试</a>
+            <a href="{{ url_for('profile') }}" class="btn btn-primary" style="width: auto; display: inline-block; padding: 8px 24px;">👤 个人中心</a>
+            <a href="{{ url_for('upload') }}" class="btn btn-primary" style="width: auto; display: inline-block; padding: 8px 24px;">📷 上传头像</a>
+            <a href="{{ url_for('page') }}?name=help" class="btn btn-primary" style="width: auto; display: inline-block; padding: 8px 24px;">❓ 帮助中心</a>
+        </div>
+
+        <!-- 搜索功能 -->
+        <div class="search-section">
+            <form method="GET" action="{{ url_for('search') }}" class="search-form">
+                <div class="search-group">
+                    <input type="text" name="keyword" class="form-input search-input" placeholder="搜索用户（用户名/邮箱）" value="{{ keyword }}" required>
+                    <button type="submit" class="btn btn-primary search-btn">搜索</button>
+                </div>
+            </form>
+        </div>
+
+        {% if search_results is not none %}
+            <div class="search-results">
+                <h3>搜索结果 (关键词: {{ keyword }})</h3>
+                {% if search_results %}
+                <table class="result-table">
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>用户名</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for row in search_results %}
+                        <tr>
+                            <td>{{ row.id }}</td>
+                            <td>{{ row.username }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                {% else %}
+                    <p class="no-results">无搜索结果</p>
+                {% endif %}
+            </div>
+        {% endif %}
+
+        <div class="user-info">
+            <h3>用户信息</h3>
+            <ul class="info-list">
+                <li><span class="info-label">用户名：</span>{{ user.username }}</li>
+                <li><span class="info-label">邮箱：</span>{{ user.email }}</li>
+                <li><span class="info-label">手机：</span>{{ user.phone }}</li>
+                <li><span class="info-label">角色：</span>{{ user.role }}</li>
+                <li><span class="info-label">余额：</span>{{ user.balance }}</li>
+            </ul>
+        </div>
+        <form method="POST" action="{{ url_for('logout') }}" class="logout-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="btn btn-primary">退出登录</button>
+        </form>
+    </div>
+{% else %}
+    <div class="card">
+        <h2 class="card-title">请先登录</h2>
+        <p class="card-text">您尚未登录，请点击下方按钮前往登录页面。</p>
+        <a href="{{ url_for('login') }}" class="btn btn-primary">前往登录</a>
+    </div>
+{% endif %}
+{% endblock %}
